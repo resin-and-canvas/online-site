@@ -551,20 +551,51 @@ async function init() {
 
 /* ================================================================
    LOAD FROM GOOGLE SHEET CSV
-   Uses a CORS proxy (allorigins.win) because browsers block
-   direct cross-origin fetches. Completely free.
+   Tries multiple free CORS proxies in order — if one is down or slow,
+   the next one is tried automatically.
 ================================================================ */
+
+// Fetch CSV text using a list of proxies — returns first success
+async function fetchCSVWithFallback(url) {
+  // Each proxy wraps the URL differently — handlers parse response accordingly
+  const proxies = [
+    {
+      // corsproxy.io — fast, reliable
+      build: u => 'https://corsproxy.io/?' + encodeURIComponent(u),
+      parse: async r => await r.text()
+    },
+    {
+      // allorigins.win — returns JSON wrapper
+      build: u => 'https://api.allorigins.win/get?url=' + encodeURIComponent(u),
+      parse: async r => { const j = await r.json(); return j.contents; }
+    },
+    {
+      // cors-anywhere via herokuapp (backup)
+      build: u => 'https://corsproxy.io/?' + encodeURIComponent(u) + '&t=' + Date.now(),
+      parse: async r => await r.text()
+    }
+  ];
+
+  let lastErr = '';
+  for (const proxy of proxies) {
+    try {
+      const res = await fetch(proxy.build(url), { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) { lastErr = 'HTTP ' + res.status; continue; }
+      const text = await proxy.parse(res);
+      if (text && text.trim().length > 0) return text;
+      lastErr = 'Empty response';
+    } catch(e) {
+      lastErr = e.message;
+    }
+  }
+  throw new Error('All proxies failed. Last error: ' + lastErr);
+}
+
 async function loadFromSheet(url, silent) {
   try {
     showBanner('warn', '⏳ Loading products from Google Sheet…');
 
-    // allorigins.win is a free CORS proxy — no account needed
-    const proxy   = 'https://api.allorigins.win/get?url=' + encodeURIComponent(url);
-    const res     = await fetch(proxy);
-    if (!res.ok) throw new Error('Network error ' + res.status);
-
-    const json    = await res.json();
-    const csv     = json.contents;
+    const csv = await fetchCSVWithFallback(url);
     if (!csv || csv.trim() === '') throw new Error('Sheet is empty or not published correctly.');
 
     const products = parseCSV(csv);
@@ -596,7 +627,7 @@ async function loadFromSheet(url, silent) {
     // Fall back to samples
     allProducts = FALLBACK_PRODUCTS;
     renderProducts(allProducts);
-    showBanner('error', '❌ Could not load Sheet: ' + e.message);
+    showBanner('error', '❌ Could not load Sheet — click Reload in Admin to retry. (' + e.message + ')');
     return false;
   }
 }
