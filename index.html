@@ -538,15 +538,17 @@ async function init() {
   const sheetUrl = localStorage.getItem(KEY_SHEET_URL);
 
   if (!sheetUrl) {
-    // No sheet connected yet — show fallback samples
     showBanner('warn', '⚠️ Showing sample products. Connect your Google Sheet in the Admin panel to show real products.');
     allProducts = FALLBACK_PRODUCTS;
     renderProducts(allProducts);
     return;
   }
 
-  // Try loading from sheet
-  await loadFromSheet(sheetUrl, true);
+  // Always fetch FRESH from sheet on every page load.
+  // Clear stale cache first so old products never show on a successful load.
+  // Cache is only kept as emergency fallback if network completely fails.
+  localStorage.removeItem(KEY_PRODUCTS);
+  await loadFromSheet(sheetUrl, true, true);
 }
 
 /* ================================================================
@@ -591,7 +593,7 @@ async function fetchCSVWithFallback(url) {
   throw new Error('All proxies failed. Last error: ' + lastErr);
 }
 
-async function loadFromSheet(url, silent) {
+async function loadFromSheet(url, silent, forceFresh) {
   try {
     showBanner('warn', '⏳ Loading products from Google Sheet…');
 
@@ -599,64 +601,93 @@ async function loadFromSheet(url, silent) {
     if (!csv || csv.trim() === '') throw new Error('Sheet is empty or not published correctly.');
 
     const products = parseCSV(csv);
-    if (products.length === 0) throw new Error('No products found. Check your sheet has data from row 2.');
+    if (products.length === 0) throw new Error('No products found. Check your sheet has data from row 2 onwards.');
 
     allProducts = products;
-    // Cache locally so repeat visits load instantly
+    // Save to cache as offline backup only — never used on normal loads
     localStorage.setItem(KEY_PRODUCTS, JSON.stringify(products));
 
     renderProducts(allProducts);
-    showBanner('ok', `✅ ${products.length} product${products.length !== 1 ? 's' : ''} loaded from Google Sheet.`);
+    showBanner('ok', `✅ ${products.length} product${products.length !== 1 ? 's' : ''} loaded from your Google Sheet.`);
     setTimeout(() => hideBanner(), 4000);
-    if (!silent) showToast('✅ Products loaded from Sheet!');
+    if (!silent) showToast('✅ Products loaded!');
 
-    // Update sheet URL input in admin if open
     const inp = document.getElementById('sheetUrlInput');
     if (inp && !inp.value) inp.value = url;
 
     return true;
   } catch(e) {
-    // Try cached version
+    // Only use cache if network completely failed (not a parse error)
     const cached = localStorage.getItem(KEY_PRODUCTS);
     if (cached) {
-      allProducts = JSON.parse(cached);
-      renderProducts(allProducts);
-      showBanner('warn', '⚠️ Could not reach Sheet — showing last saved products. (' + e.message + ')');
-      return false;
+      try {
+        allProducts = JSON.parse(cached);
+        renderProducts(allProducts);
+        showBanner('warn', '⚠️ Could not reach Sheet right now — showing last loaded products. Go to Admin → Reload Products to refresh. (' + e.message + ')');
+        return false;
+      } catch(_) {}
     }
-    // Fall back to samples
     allProducts = FALLBACK_PRODUCTS;
     renderProducts(allProducts);
-    showBanner('error', '❌ Could not load Sheet — click Reload in Admin to retry. (' + e.message + ')');
+    showBanner('error', '❌ Could not load Sheet: ' + e.message + ' — Go to Admin and click Reload Products.');
     return false;
   }
 }
 
 /* ================================================================
-   PARSE CSV → products array
-   Handles quoted fields containing commas and newlines.
+   PARSE CSV — robust parser that handles:
+   - Windows (\r\n) and Unix (\n) line endings
+   - Quoted fields with commas inside
+   - Quoted fields with newlines inside
+   - Semicolon-separated sheets (some locales)
+   - Extra whitespace in headers
 ================================================================ */
-function parseCSV(csv) {
-  const lines = csv.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
+function parseCSV(raw) {
+  // Normalise line endings
+  const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
 
-  // Parse header row — trim whitespace and lowercase
-  const headers = csvSplitLine(lines[0]).map(h => h.trim().toLowerCase());
+  // Auto-detect delimiter: comma or semicolon
+  const firstLine = text.split('\n')[0];
+  const delim = (firstLine.split(';').length > firstLine.split(',').length) ? ';' : ',';
+
+  // Full RFC-4180 parser — handles quoted newlines correctly
+  function parseAllCells(src, sep) {
+    const rows = [];
+    let row = [], cur = '', inQ = false, i = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (inQ) {
+        if (ch === '"' && src[i+1] === '"') { cur += '"'; i += 2; continue; }
+        if (ch === '"') { inQ = false; i++; continue; }
+        cur += ch; i++; continue;
+      }
+      if (ch === '"') { inQ = true; i++; continue; }
+      if (ch === sep) { row.push(cur.trim()); cur = ''; i++; continue; }
+      if (ch === '\n') {
+        row.push(cur.trim()); cur = '';
+        if (row.some(c => c !== '')) rows.push(row);
+        row = []; i++; continue;
+      }
+      cur += ch; i++;
+    }
+    row.push(cur.trim());
+    if (row.some(c => c !== '')) rows.push(row);
+    return rows;
+  }
+
+  const rows = parseAllCells(text, delim);
+  if (rows.length < 2) return [];
+
+  // Headers: lowercase + strip BOM + strip quotes
+  const headers = rows[0].map(h => h.toLowerCase().replace(/^\uFEFF/, '').replace(/^"+|"+$/g,'').trim());
 
   const products = [];
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const cols = csvSplitLine(line);
-    if (cols.length === 0 || !cols[0]) continue; // skip empty rows
-
+  for (let i = 1; i < rows.length; i++) {
+    const cols = rows[i];
     const row = {};
-    headers.forEach((h, idx) => {
-      row[h] = (cols[idx] || '').trim();
-    });
+    headers.forEach((h, idx) => { row[h] = (cols[idx] || '').trim(); });
 
-    // Skip rows with no name
-    if (!row['name']) continue;
+    if (!row['name']) continue; // skip blank rows
 
     products.push({
       id:           'gs_' + i,
@@ -664,32 +695,19 @@ function parseCSV(csv) {
       price:        parseFloat(row['price']) || 0,
       category:     row['category']     || 'Other',
       image:        row['image']        || '',
-      available:    row['available']    ? row['available'].toUpperCase() !== 'FALSE' : true,
-      customizable: row['customizable'] ? row['customizable'].toUpperCase() !== 'FALSE' : false,
-      shortDesc:    row['shortdesc']    || row['short_desc']    || row['shortdescription'] || '',
-      fullDesc:     row['fulldesc']     || row['full_desc']     || row['fulldescription']  || row['shortdesc'] || ''
+      // available: anything except exactly "FALSE" (case-insensitive) = true
+      available:    row['available']
+                      ? !['false','0','no'].includes(row['available'].toLowerCase())
+                      : true,
+      // customizable: only "TRUE"/"yes"/"1" = true
+      customizable: row['customizable']
+                      ? ['true','yes','1'].includes(row['customizable'].toLowerCase())
+                      : false,
+      shortDesc: row['shortdesc'] || row['short_desc'] || row['shortdescription'] || row['description'] || '',
+      fullDesc:  row['fulldesc']  || row['full_desc']  || row['fulldescription']  || row['shortdesc']   || row['description'] || ''
     });
   }
   return products;
-}
-
-// Splits one CSV line respecting double-quoted fields
-function csvSplitLine(line) {
-  const result = [];
-  let cur = '', inQ = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQ && line[i+1] === '"') { cur += '"'; i++; }
-      else inQ = !inQ;
-    } else if (ch === ',' && !inQ) {
-      result.push(cur); cur = '';
-    } else {
-      cur += ch;
-    }
-  }
-  result.push(cur);
-  return result;
 }
 
 /* ================================================================
